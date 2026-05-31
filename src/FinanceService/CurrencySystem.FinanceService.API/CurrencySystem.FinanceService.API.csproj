@@ -1,5 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
+  <ItemGroup>
+    <ProjectReference Include="..\CurrencySystem.FinanceService.Infrastructure\CurrencySystem.FinanceService.Infrastructure.csproj" />
+    <ProjectReference Include="..\CurrencySystem.FinanceService.Application\CurrencySystem.FinanceService.Application.csproj" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
