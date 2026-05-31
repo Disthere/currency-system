@@ -1,0 +1,55 @@
+# .NET
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.dll
+*.exe
+*.pdb
+*.cache
+*.nupkg
+*.snupkg
+
+# Build folders
+build/
+publish/
+
+# NuGet
+*.nupkg
+packages/
+!**/packages.config
+!**/packages.props
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+.idea/
+
+# Docker
+.dockerenv
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+[Tt]est[Rr]esult*/
+[Tt]est[Ss]ettings*.xml
+
+# Environment files
+*.env
+.env.*
+
+# Secrets (never commit!)
+appsettings.*.Secret.json
+*.pfx
+*.p12
