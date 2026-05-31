@@ -1,5 +1,299 @@
 # Study Log — Currency System Project
 
+---
+
+## 📐 Этап 1: Архитектура и паттерны — 01.06.2026
+
+### 📖 Подробное объяснение: что сделано и зачем
+
+---
+
+## 1. Clean Architecture — архитектура слоёв
+
+### Что это такое?
+
+**Clean Architecture** — это подход к организации кода, где проект разделяется на концентрические слои. Ключевое правило: **внешние слои зависят от внутренних, но НЕ наоборот**.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                        API (Outer)                        │  ← Веб-контроллеры, Minimal API endpoints
+├──────────────────────────────────────────────────────────┤
+│                  Infrastructure (Outer)                   │  ← БД (EF Core), Kafka, внешние API, файловая система
+├──────────────────────────────────────────────────────────┤
+│                   Application (Inner)                     │  ← Бизнес-логика: CQRS команды/запросы, валидация
+├──────────────────────────────────────────────────────────┤
+│                     Domain (Core)                         │  ← Чистая бизнес-логика: сущности, интерфейсы
+└──────────────────────────────────────────────────────────┘
+```
+
+### Почему так?
+
+**Domain (ядро)** — НЕ зависит ни от чего. Это чистые классы/записи с бизнес-правилами. Если вы решите заменить PostgreSQL на MongoDB, или Kafka на RabbitMQ — Domain НЕ изменится.
+
+**Application** — зависит только от Domain. Содержит бизнес-логику в виде use-cases (CQRS handlers). Не знает о базе данных, HTTP, Kafka.
+
+**Infrastructure** — зависит от Application и Domain. Реализует интерфейсы: EF DbContext, репозитории, Kafka producer/consumer, HTTP клиенты.
+
+**API** — зависит от всех слоёв. Тонкий слой: только endpoints, DI, middleware.
+
+### Project References (зависимости)
+
+```
+UserService.API
+  ├── UserService.Infrastructure
+  │     └── UserService.Application
+  │           ├── UserService.Domain
+  │           └── CurrencySystem.Contracts (shared события)
+  └── UserService.Application (прямая ссылка для DI)
+
+FinanceService.API
+  ├── FinanceService.Infrastructure
+  │     └── FinanceService.Application
+  │           ├── FinanceService.Domain
+  │           └── CurrencySystem.Contracts (shared события)
+  └── FinanceService.Application (прямая ссылка для DI)
+```
+
+**Интервью-вопрос:** Почему Domain НЕ должен зависеть от Application?
+**Ответ:** Domain — это ядро бизнес-логики. Если Domain начнёт зависеть от Application, получится циклическая зависимость (цикл). Компилятор не позволит. Но главное — Domain должен быть независимым от фреймворков, БД, UI. Это позволяет легко тестировать Domain и переиспользовать его.
+
+---
+
+## 2. Domain-модели — что создали
+
+### User (UserService.Domain)
+
+```csharp
+public class User
+{
+    public Guid Id { get; private set; }
+    public string Name { get; private set; } = string.Empty;
+    public string PasswordHash { get; private set; } = string.Empty;
+    public List<string> FavoriteCurrencies { get; private set; } = new();
+    public DateTime CreatedAt { get; private set; }
+}
+```
+
+**Ключевые решения:**
+
+| Решение | Почему |
+|---------|--------|
+| `private set` | Инкапсуляция — свойства можно изменить только через конструктор или методы |
+| `PasswordHash`, а не `Password` | Храним хэш, а не пароль в открытом виде (безопасность) |
+| `FavoriteCurrencies` как `List<string>` | Список ISO-кодов валют: ["USD", "EUR", "CNY"] |
+| `private User() { }` | Конструктор для EF Core (требует пустой конструктор) |
+| `SetFavoriteCurrencies()` | Метод для изменения избранных валют |
+
+### Currency (FinanceService.Domain)
+
+```csharp
+public class Currency
+{
+    public Guid Id { get; private set; }
+    public string Name { get; private set; } = string.Empty;
+    public string Code { get; private set; } = string.Empty;  // USD, EUR, CNY
+    public decimal Rate { get; private set; }                  // Курс к рублю
+    public decimal Nominal { get; private set; } = 1;          // Номинал
+    public DateTime UpdatedAt { get; private set; }
+}
+```
+
+**Ключевые решения:**
+
+| Решение | Почему |
+|---------|--------|
+| `decimal`, а не `double` | `decimal` для денег — точная арифметика (1.1 + 2.2 = 3.3, не 3.3000000000000003) |
+| `Code` — ISO код | Стандарт: USD (доллар), EUR (евро), CNY (юань) |
+| `Nominal` | CBR публикует курсы для разного номинала (например, 10 йен = X рублей) |
+| `UpdateRate()` | Метод для обновления курса с фиксацией времени |
+
+---
+
+## 3. Kafka контракты (shared events)
+
+### CurrencyRatesUpdatedEvent
+
+```csharp
+public record CurrencyRatesUpdatedEvent(
+    Guid EventId,
+    DateTime OccurredAt,
+    IReadOnlyList<CurrencyRateItem> Rates,
+    string Source = "cbr.ru"
+);
+
+public record CurrencyRateItem(
+    string CurrencyCode,
+    string CurrencyName,
+    decimal RateToRub,
+    decimal Nominal
+);
+```
+
+**Почему `record`, а не `class`?**
+- `record` — неизменяемый (immutable) по умолчанию
+- Идеально для событий: создал → отправил → забыл
+- Автоматическая реализация `Equals()`, `GetHashCode()` — удобно для тестов
+- Компактный синтаксис (positional parameters)
+
+**Почему `IReadOnlyList`?**
+- Получатель события НЕ должен модифицировать список
+- Явная контракта: "вот данные, они только для чтения"
+
+### Зачем отдельный проект Contracts?
+
+**Проблема:** Два сервиса (CurrencyParser и FinanceService) должны знать структуру одного события.
+
+**Вариант А:** Каждый сервис определяет свою версию события.
+- ❌ Риск рассинхронизации полей
+- ❌ Сложность при изменении контракта
+
+**Вариант Б:** Shared проект Contracts.
+- ✅ Один источник правды
+- ✅ Оба сервиса используют один тип
+- ✅ Изменил контракт → оба сервиса обновились
+
+**Интервью-вопрос:** Где хранить контракты событий в микросервисной архитектуре?
+**Ответ:** Есть 3 подхода:
+1. **Shared Kernel** (наш вариант) — один проект, который линкуют все сервисы. Просто, но создаёт耦合.
+2. **Contract Repository** — отдельный репозиторий, подключаемый как NuGet-пакет. Чище, но сложнее CI/CD.
+3. **Schema Registry** (Avro) — контракты хранятся в Kafka. Строгая типизация, но требует инфраструктуру.
+Для тестового проекта Shared Kernel — оптимально. Для production — Schema Registry или NuGet-пакеты.
+
+---
+
+## 4. Почему `record` вместо `class`?
+
+| Характеристика | `class` | `record` |
+|---------------|---------|----------|
+| Изменяемость | Mutable (по умолчанию) | Immutable (позиционные параметры) |
+| Сравнение | По ссылке | По значению (value-based) |
+| `Equals()` | Reference equality | Structural equality |
+| `ToString()` | Имя типа | Имя типа + все свойства |
+| `with` выражение | Нет | Да (копирование с изменением) |
+| Идеально для | Сущности БД, сервисы | DTO, события, команды |
+
+**Пример `with` для событий:**
+```csharp
+var event1 = new CurrencyRatesUpdatedEvent(Guid.NewGuid(), DateTime.UtcNow, rates);
+var event2 = event1 with { Source = "ecb.eu" }; // Копия с изменением Source
+```
+
+---
+
+## 5. Project References — как работают
+
+### Команда добавления ссылки
+```bash
+dotnet add ProjectA.csproj reference ProjectB.csproj
+```
+
+### Что происходит в .csproj файле
+```xml
+<ItemGroup>
+  <ProjectReference Include="..\ProjectB\ProjectB.csproj" />
+</ItemGroup>
+```
+
+### Как компилятор использует ссылки
+1. Компилирует ProjectB
+2. Создаёт ProjectB.dll
+3. Компилирует ProjectA, подключая ProjectB.dll
+4. Если ProjectB не компилируется → ProjectA тоже не скомпилируется
+
+### Порядок компиляции (зависимости)
+```
+1. Domain (нет зависимостей)
+2. Contracts (нет зависимостей)
+3. Application (зависит от Domain + Contracts)
+4. Infrastructure (зависит от Application)
+5. API (зависит от Infrastructure + Application)
+```
+
+---
+
+## 6. Типы данных для денег
+
+### Почему `decimal`, а не `double`/`float`?
+
+```csharp
+// double — проблемы с точностью
+double a = 0.1 + 0.2;  // 0.30000000000000004 (!)
+double b = 1.1 + 2.2;  // 3.3000000000000003 (!)
+
+// decimal — точная арифметика
+decimal c = 0.1m + 0.2m;  // 0.3
+decimal d = 1.1m + 2.2m;  // 3.3
+```
+
+**Причина:** `double` использует двоичное представление (IEEE 754). Число 0.1 в двоичной системе — бесконечная дробь, поэтому округляется. `decimal` — десятичное представление, специально для финансов.
+
+**Правило:** ВСЕГДА используйте `decimal` для денег и курсов валют. `double` — для научных вычислений, где допустима погрешность.
+
+---
+
+## 7. Сборка решения
+
+### Команда
+```bash
+dotnet build CurrencySystem.sln
+```
+
+### Результат
+```
+Сборка успешно завершена.
+    Предупреждений: 0
+    Ошибок: 0
+    Прошло времени: 00:00:02.12
+```
+
+Все 13 проектов скомпилированы без ошибок.
+
+---
+
+## 🎤 Интервью-вопросы и ответы
+
+**В: Что такое Clean Architecture и зачем она нужна?**
+О: Это подход к организации кода с разделением на слои (Domain, Application, Infrastructure, API). Внешние слои зависят от внутренних, но не наоборот. Позволяет легко тестировать бизнес-логику, заменить инфраструктуру (БД, брокер сообщений) без изменения ядра, соблюдать Single Responsibility.
+
+**В: В чём разница между `class` и `record` в C#?**
+O: `record` — immutable (неизменяемый) по умолчанию, сравнивается по значению (value-based equality), а не по ссылке. Имеет встроенную реализацию `Equals()`, `GetHashCode()`, `ToString()`. Поддерживает `with` выражение для копирования с изменениями. Идеально для DTO, событий, команд.
+
+**В: Почему для денег используют `decimal`, а не `double`?**
+О: `double` использует двоичное представление чисел (IEEE 754), что приводит к погрешностям (0.1 + 0.2 = 0.30000000000000004). `decimal` использует десятичное представление, обеспечивая точную арифметику. Для финансов это критично.
+
+**В: Где хранить контракты событий в микросервисной архитектуре?**
+О: 3 подхода: (1) Shared Kernel — один проект для всех сервисов, просто для небольших проектов. (2) Contract Repository — отдельный репозиторий как NuGet-пакет, чище для production. (3) Schema Registry — контракты в Kafka, строгая типизация, но требует инфраструктуру.
+
+---
+
+## ⚠️ Типичные ошибки (красные флаги)
+
+| Ошибка | Почему плохо | Как исправить |
+|--------|-------------|---------------|
+| Domain зависит от Infrastructure | Циклическая зависимость, невозможно тестировать | Инвертировать: Infrastructure зависит от Domain |
+| `double` для курсов валют | Потеря точности, ошибки в расчётах | Использовать `decimal` |
+| Public set для всех свойств | Любая часть кода может изменить сущность | Private set, изменение через методы |
+| Дублирование контрактов событий | Рассинхронизация при изменении | Shared проект или NuGet-пакет |
+| God Object (один класс на всё) | Нарушение SRP, сложно тестировать | Разделять на маленькие классы |
+
+---
+
+## 🔗 Ресурсы
+
+- [Clean Architecture by Uncle Bob](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
+- [Records in C# 9+](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record)
+- [Decimal vs Double in C#](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/floating-point-numeric-types)
+- [Domain-Driven Design](https://martinfowler.com/books/ddd.html)
+
+---
+
+## ▶️ Следующий шаг
+**Этап 2: Базовая инфраструктура данных** — EF Core, DbContext, миграции, настройка подключения к PostgreSQL.
+
+> ⚡ **Правило:** Не переходи к следующему этапу без согласия пользователя.
+
+---
+
 ## Этап 0: Подготовка инфраструктуры в Docker — 31.05.2026
 
 ### 📖 Подробное объяснение: что сделано и зачем
@@ -291,9 +585,6 @@ FinanceService.Application → Contracts
 - [Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
 - [.NET 9 Docker images](https://hub.docker.com/_/microsoft-dotnet)
 
-### ▶️ Следующий шаг
-**Этап 1: Архитектура и паттерны** — Clean Architecture, CQRS, MediatR, Event-Driven Architecture. Настроим проект CurrencySystem.Contracts (Kafka события) и Domain-модели.
-
 ---
 
 ## Git — настройка репозитория
@@ -323,7 +614,7 @@ FinanceService.Application → Contracts
 ### 2. Инициализация репозитория
 
 ```bash
-git init              # Создаёт локаный .git репозиторий
+git init              # Создаёт локальный .git репозиторий
 git add .             # Добавляет ВСЕ файлы в staging (подготовка к коммиту)
 git status            # Показывает, что будет закоммичено
 ```
@@ -336,7 +627,7 @@ git status            # Показывает, что будет закоммич
 git commit -m "feat: initialize CurrencySystem project..."
 ```
 
-**Convention Commits:**
+**Conventional Commits:**
 - `feat:` — новая функциональность
 - `fix:` — исправление бага
 - `docs:` — документация
